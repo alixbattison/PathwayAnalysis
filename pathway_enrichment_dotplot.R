@@ -16,6 +16,10 @@
 #   The CONDITION_MAP list maps regex patterns (matched against the prefix
 #   extracted from each sample column) to a condition label.
 #   One condition must be named "Control" — all others are compared to it.
+
+#  Each condition (Cancer, Torpor, Torpor+Cancer) is compared to the Control group (NN + C samples)
+#  For each metabolic pathway, it takes all compound intensities in that pathway across all replicates in the condition vs. all replicates in Control, and runs a Mann-Whitney U test
+#  The fold enrichment is the ratio of medians (condition / control)
 #
 # REQUIRED R PACKAGES:
 #   readxl, dplyr, tidyr, ggplot2, stringr, purrr, scales
