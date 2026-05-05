@@ -1,0 +1,579 @@
+################################################################################
+# Metabolomics Pathway Enrichment Analysis with aPEAR Visualization
+#
+# This script:
+# 1. Reads an Excel file with compound intensity data across 4 conditions
+# 2. Computes average intensities per condition (NC, NN, TN, TC)
+# 3. Maps compound names to KEGG compound IDs
+# 4. Performs pathway enrichment (ORA) per condition using clusterProfiler::enricher
+# 5. Visualizes enrichment networks using aPEAR::enrichmentNetwork
+# 6. Performs differential enrichment analysis across conditions
+# 7. Visualizes differentially enriched compound pathways with aPEAR
+# 8. Exports all results to Excel and PNG figures
+################################################################################
+
+# ── Install / load packages ──────────────────────────────────────────────────
+
+required_pkgs <- c("readxl", "writexl", "dplyr", "tidyr", "stringr", "ggplot2",
+                   "purrr", "tibble")
+bioc_pkgs <- c("clusterProfiler", "KEGGREST")
+cran_extra <- c("aPEAR")
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg, repos = "https://cran.r-project.org")
+}
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager", repos = "https://cran.r-project.org")
+for (pkg in bioc_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) BiocManager::install(pkg, ask = FALSE, update = FALSE)
+}
+for (pkg in cran_extra) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg, repos = "https://cran.r-project.org")
+}
+
+library(readxl)
+library(writexl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(purrr)
+library(tibble)
+library(clusterProfiler)
+library(KEGGREST)
+library(aPEAR)
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+# ** SET YOUR INPUT FILE PATH HERE **
+input_file <- "test_plasma_HILIC_rawintensities.xlsx"   # <-- Replace with your Excel file path
+output_dir <- "results"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Significance thresholds
+# NOTE: Metabolomics ORA with compound names typically has low KEGG mapping
+# rates, so we use very relaxed thresholds to capture more pathways for
+# the aPEAR network visualization. The network itself helps you see which
+# clusters are meaningful.
+pvalue_cutoff   <- 1.0    # Include all pathways (let aPEAR network show structure)
+qvalue_cutoff   <- 1.0    # Disable q-value filter
+fc_threshold    <- 1.5    # fold-change threshold for differential analysis
+
+# aPEAR network settings
+apear_similarity_cutoff <- 0.1   # Lower = more edges/connections (default 0.5)
+apear_min_pathways      <- 2     # Minimum pathways needed to draw a network
+
+# ── 1. Read data ─────────────────────────────────────────────────────────────
+
+cat("── Step 1: Reading input data ──\n")
+df_raw <- read_excel(input_file)
+
+# Identify sample columns (start with "Plasma_")
+plasma_cols <- grep("^Plasma_", colnames(df_raw), value = TRUE)
+cat("  Found", length(plasma_cols), "sample columns\n")
+
+# Assign conditions based on column naming pattern
+# Expected: Plasma_NC1, Plasma_NC2, Plasma_NN1, Plasma_NN2, etc.
+assign_condition <- function(col_name) {
+  # Remove "Plasma_" prefix, then extract the letter code (before any digit)
+  suffix <- str_remove(col_name, "^Plasma_")
+  condition <- str_extract(suffix, "^[A-Za-z]+")
+  return(condition)
+}
+
+condition_map <- tibble(
+  sample = plasma_cols,
+  condition = sapply(plasma_cols, assign_condition)
+)
+
+conditions <- unique(condition_map$condition)
+cat("  Conditions detected:", paste(conditions, collapse = ", "), "\n")
+cat("  Samples per condition:\n")
+print(table(condition_map$condition))
+
+# ── 2. Compute average intensities per condition ─────────────────────────────
+
+cat("\n── Step 2: Computing average intensities per condition ──\n")
+
+df_avg <- df_raw %>%
+  select(Name, all_of(plasma_cols)) %>%
+  pivot_longer(cols = all_of(plasma_cols), names_to = "sample", values_to = "intensity") %>%
+  left_join(condition_map, by = "sample") %>%
+  group_by(Name, condition) %>%
+  summarise(avg_intensity = mean(intensity, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = condition, values_from = avg_intensity, names_prefix = "avg_")
+
+cat("  Computed averages for", nrow(df_avg), "compounds across", length(conditions), "conditions\n")
+
+# ── 3. Map compound names to KEGG IDs ────────────────────────────────────────
+
+cat("\n── Step 3: Mapping compound names to KEGG compound IDs ──\n")
+
+compound_names <- unique(df_raw$Name)
+cache_file_mapping <- file.path(output_dir, "kegg_mapping_cache.rds")
+
+if (file.exists(cache_file_mapping)) {
+  cat("  Loading cached KEGG mapping from previous run...\n")
+  kegg_mapping <- readRDS(cache_file_mapping)
+  cat("  Loaded", nrow(kegg_mapping), "cached mappings\n")
+  # Check for any new compounds not in cache
+  new_compounds <- setdiff(compound_names, kegg_mapping$Name)
+  if (length(new_compounds) > 0) {
+    cat("  Querying", length(new_compounds), "new compounds...\n")
+  }
+} else {
+  kegg_mapping <- tibble(Name = character(), kegg_id = character())
+  new_compounds <- compound_names
+  cat("  No cache found. Querying KEGG for", length(new_compounds), "compounds...\n")
+  cat("  This will take several minutes (rate-limited to avoid KEGG blocks)...\n")
+}
+
+# Function to search KEGG for a compound name
+search_kegg_compound <- function(compound_name) {
+  tryCatch({
+    result <- keggFind("compound", compound_name)
+    if (length(result) > 0) {
+      kegg_id <- names(result)[1]
+      kegg_id <- str_remove(kegg_id, "^cpd:")
+      return(kegg_id)
+    }
+    return(NA_character_)
+  }, error = function(e) {
+    return(NA_character_)
+  })
+}
+
+# Query KEGG only for compounds not already cached
+if (length(new_compounds) > 0) {
+  new_mapping <- tibble(Name = new_compounds, kegg_id = NA_character_)
+  for (i in seq_along(new_compounds)) {
+    if (i %% 10 == 0 || i == 1) cat("  Querying compound", i, "of", length(new_compounds), "\r")
+    new_mapping$kegg_id[i] <- search_kegg_compound(new_compounds[i])
+    Sys.sleep(0.5)  # Slower rate to avoid 403 errors
+  }
+  cat("\n")
+  kegg_mapping <- bind_rows(kegg_mapping, new_mapping)
+  # Save cache for next run
+  saveRDS(kegg_mapping, cache_file_mapping)
+  cat("  Saved KEGG mapping cache to:", cache_file_mapping, "\n")
+}
+
+mapped_count <- sum(!is.na(kegg_mapping$kegg_id))
+cat("  Successfully mapped", mapped_count, "of", length(compound_names), "compounds to KEGG IDs\n")
+
+# ── 4. Build KEGG compound-to-pathway reference ─────────────────────────────
+
+cat("\n── Step 4: Building KEGG compound-to-pathway reference ──\n")
+
+cache_file_pathways <- file.path(output_dir, "kegg_pathways_cache.rds")
+
+if (file.exists(cache_file_pathways)) {
+  cat("  Loading cached pathway database...\n")
+  pathway_cache <- readRDS(cache_file_pathways)
+  term2gene <- pathway_cache$term2gene
+  term2name <- pathway_cache$term2name
+} else {
+  cat("  Downloading KEGG compound-to-pathway links (one large query)...\n")
+  cat("  If this fails with HTTP 403, wait 15-20 minutes and re-run.\n")
+  cat("  The compound mapping from Step 3 is cached, so Step 3 will be instant.\n")
+  
+  # These are just 2 API calls (not hundreds), but KEGG may still block if
+  # we already made 1000+ calls in Step 3 during this session
+  kegg_cpd2path <- keggLink("pathway", "compound")
+  kegg_path_names <- keggList("pathway")
+  
+  # Build TERM2GENE data frame (pathway -> compound)
+  term2gene <- tibble(
+    pathway = kegg_cpd2path,
+    compound = names(kegg_cpd2path)
+  ) %>%
+    mutate(
+      pathway = str_remove(pathway, "^path:"),
+      compound = str_remove(compound, "^cpd:")
+    ) %>%
+    filter(str_detect(pathway, "^map"))
+  
+  # Build TERM2NAME (pathway ID -> pathway description)
+  term2name <- tibble(
+    pathway = names(kegg_path_names),
+    name = as.character(kegg_path_names)
+  ) %>%
+    mutate(pathway = str_remove(pathway, "^path:")) %>%
+    filter(str_detect(pathway, "^map"))
+  
+  # Cache for future runs
+  saveRDS(list(term2gene = term2gene, term2name = term2name), cache_file_pathways)
+  cat("  Saved pathway cache to:", cache_file_pathways, "\n")
+}
+
+cat("  Reference contains", n_distinct(term2gene$pathway), "pathways and",
+    n_distinct(term2gene$compound), "compounds\n")
+
+# Remove plant-related pathways (not relevant for plasma metabolomics)
+plant_keywords <- regex(
+  paste0("photosynthes|plant.hormone|plant.pathogen|flavonoid|flavone|",
+         "isoflavonoid|anthocyanin|carotenoid.biosyn|stilbenoid|diarylheptanoid|",
+         "gingerol|phenylpropanoid|monolignol|lignan|coumarin|",
+         "indole.alkaloid|isoquinoline.alkaloid|tropane.*alkaloid|",
+         "monoterpenoid|diterpenoid|sesquiterpenoid|triterpenoid|",
+         "zeatin|brassinosteroid|glucosinolate|benzoxazinoid|",
+         "betalain|cutin.*suberin|circadian.rhythm.-.plant"),
+  ignore_case = TRUE
+)
+
+# Remove addiction, substance abuse, and disease-specific signaling pathways
+# These are gene-centric KEGG disease pathways that show up as noise in
+# compound-level metabolomics enrichment
+disease_addiction_keywords <- regex(
+  paste0("alcoholism|cocaine.addiction|amphetamine.addiction|",
+         "morphine.addiction|nicotine.addiction|substance.dependence|",
+         "alcoholic.liver.disease|",
+         # Cancer-specific signaling pathways (not metabolic)
+         "small.cell.lung.cancer|non-small.cell.lung|colorectal.cancer|",
+         "pancreatic.cancer|hepatocellular.carcinoma|gastric.cancer|",
+         "breast.cancer|prostate.cancer|bladder.cancer|renal.cell.carcinoma|",
+         "thyroid.cancer|melanoma|glioma|chronic.myeloid.leukemia|",
+         "acute.myeloid.leukemia|basal.cell.carcinoma|endometrial.cancer|",
+         "pathways.in.cancer|proteoglycans.in.cancer|",
+         "central.carbon.metabolism.in.cancer|choline.metabolism.in.cancer|",
+         # Infectious disease pathways
+         "vibrio.cholerae|pathogenic.escherichia|salmonella|shigellosis|",
+         "pertussis|legionellosis|staphylococcus|tuberculosis|",
+         "helicobacter|epithelial.cell.signaling|",
+         "hepatitis|influenza|measles|herpes|hiv|htlv|epstein|",
+         "kaposi|human.papillomavirus|human.cytomegalovirus|",
+         "coronavirus|malaria|toxoplasm|leishmani|chagas|amoebiasis|trypanosomi|",
+         # Neurodegenerative disease pathways
+         "alzheimer|parkinson|huntington|amyotrophic|prion|neurodegeneration|",
+         # Cardiovascular disease pathways
+         "hypertrophic.cardiomyopathy|dilated.cardiomyopathy|",
+         "arrhythmogenic|viral.myocarditis|",
+         # Immune disease pathways
+         "asthma|systemic.lupus|autoimmune|rheumatoid|",
+         "graft.versus.host|allograft.rejection|",
+         # Other disease pathways
+         "diabetic.complication|non-alcoholic.fatty.liver|",
+         "AGE-RAGE|fluid.shear.stress"),
+  ignore_case = TRUE
+)
+
+before_filter <- n_distinct(term2name$pathway)
+term2name <- term2name %>%
+  filter(!str_detect(name, plant_keywords)) %>%
+  filter(!str_detect(name, disease_addiction_keywords))
+term2gene <- term2gene %>% filter(pathway %in% term2name$pathway)
+after_filter <- n_distinct(term2name$pathway)
+
+cat("  Removed", before_filter - after_filter, "plant/disease/addiction pathways\n")
+cat("  Remaining:", after_filter, "pathways and",
+    n_distinct(term2gene$compound), "compounds\n")
+
+# ── 5. Pathway enrichment per condition ──────────────────────────────────────
+
+cat("\n── Step 5: Running pathway enrichment for each condition ──\n")
+
+# Use the full KEGG compound space as the universe (not just our mapped compounds).
+# This is critical: using only our mapped compounds as the universe makes the
+# hypergeometric test underpowered because nearly all of them appear in each condition.
+all_kegg_ids <- unique(term2gene$compound)
+cat("  Universe size:", length(all_kegg_ids), "KEGG compounds\n")
+
+run_enrichment <- function(compound_kegg_ids, label) {
+  if (length(compound_kegg_ids) < 3) {
+    cat("  WARNING:", label, "- too few mapped compounds for enrichment\n")
+    return(NULL)
+  }
+  
+  res <- tryCatch({
+    enricher(
+      gene      = compound_kegg_ids,
+      TERM2GENE = term2gene,
+      TERM2NAME = term2name,
+      pvalueCutoff  = pvalue_cutoff,
+      qvalueCutoff  = qvalue_cutoff,
+      minGSSize = 2,
+      maxGSSize = 500
+      # No universe argument = uses all compounds in TERM2GENE as background
+    )
+  }, error = function(e) {
+    cat("  ERROR in", label, ":", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (is.null(res) || nrow(as.data.frame(res)) == 0) {
+    cat("  INFO:", label, "- no significant pathways found (try relaxing thresholds)\n")
+    return(NULL)
+  }
+  
+  cat("  ", label, ":", nrow(as.data.frame(res)), "significant pathways\n")
+  return(res)
+}
+
+# For each condition, use ALL compounds detected (non-zero avg intensity) in that condition
+enrichment_results <- list()
+
+for (cond in conditions) {
+  avg_col <- paste0("avg_", cond)
+  
+  # Get compounds with non-zero intensity in this condition
+  cond_compounds <- df_avg %>%
+    filter(!is.na(.data[[avg_col]]) & .data[[avg_col]] > 0) %>%
+    pull(Name)
+  
+  # Map to KEGG IDs
+  cond_kegg_ids <- kegg_mapping %>%
+    filter(Name %in% cond_compounds, !is.na(kegg_id)) %>%
+    pull(kegg_id) %>%
+    unique()
+  
+  cat("  Condition", cond, ":", length(cond_compounds), "compounds ->",
+      length(cond_kegg_ids), "mapped to KEGG\n")
+  
+  enrichment_results[[cond]] <- run_enrichment(cond_kegg_ids, cond)
+}
+
+# ── 6. aPEAR visualization per condition ─────────────────────────────────────
+
+cat("\n── Step 6: Generating aPEAR enrichment network plots per condition ──\n")
+
+for (cond in names(enrichment_results)) {
+  res <- enrichment_results[[cond]]
+  if (is.null(res)) next
+  
+  res_df <- as.data.frame(res)
+  if (nrow(res_df) < apear_min_pathways) {
+    cat("  Skipping", cond, "- fewer than", apear_min_pathways, "pathways for network\n")
+    next
+  }
+  
+  cat("  Plotting", cond, "with", nrow(res_df), "pathways...\n")
+  
+  tryCatch({
+    p <- enrichmentNetwork(
+      res_df,
+      repelLabels      = TRUE,
+      drawEllipses     = TRUE,
+      colorBy          = "p.adjust",
+      nodeSize         = "Count",
+      similarityCutoff = apear_similarity_cutoff,
+      verbose          = FALSE
+    )
+    
+    p <- p + ggtitle(paste0("Pathway Enrichment Network — ", cond)) +
+      theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+    
+    out_path <- file.path(output_dir, paste0("apear_network_", cond, ".png"))
+    ggsave(out_path, p, width = 12, height = 10, dpi = 300, bg = "white")
+    cat("  Saved:", out_path, "\n")
+  }, error = function(e) {
+    cat("  ERROR plotting", cond, ":", e$message, "\n")
+  })
+}
+
+# ── 7. Differential enrichment analysis ──────────────────────────────────────
+
+cat("\n── Step 7: Differential analysis across conditions ──\n")
+
+# Generate all pairwise comparisons
+comparisons <- combn(conditions, 2, simplify = FALSE)
+cat("  Pairwise comparisons:", length(comparisons), "\n")
+
+diff_results <- list()
+
+for (comp in comparisons) {
+  cond_a <- comp[1]
+  cond_b <- comp[2]
+  label  <- paste0(cond_a, "_vs_", cond_b)
+  cat("  Comparing:", label, "\n")
+  
+  avg_a <- paste0("avg_", cond_a)
+  avg_b <- paste0("avg_", cond_b)
+  
+  # Compute fold change (B / A) and identify differentially abundant compounds
+  diff_df <- df_avg %>%
+    filter(!is.na(.data[[avg_a]]) & !is.na(.data[[avg_b]])) %>%
+    mutate(
+      # Add small pseudocount to avoid division by zero
+      fc = (.data[[avg_b]] + 1) / (.data[[avg_a]] + 1),
+      log2fc = log2(fc),
+      direction = case_when(
+        fc >= fc_threshold  ~ "up",
+        fc <= 1/fc_threshold ~ "down",
+        TRUE ~ "unchanged"
+      )
+    )
+  
+  # Differentially abundant compounds
+  diff_compounds <- diff_df %>%
+    filter(direction != "unchanged") %>%
+    pull(Name)
+  
+  cat("    ", length(diff_compounds), "differentially abundant compounds",
+      "(FC threshold:", fc_threshold, ")\n")
+  
+  if (length(diff_compounds) == 0) {
+    cat("    No differential compounds found for", label, "\n")
+    next
+  }
+  
+  # Map to KEGG IDs
+  diff_kegg_ids <- kegg_mapping %>%
+    filter(Name %in% diff_compounds, !is.na(kegg_id)) %>%
+    pull(kegg_id) %>%
+    unique()
+  
+  cat("    ", length(diff_kegg_ids), "mapped to KEGG IDs\n")
+  
+  # Run enrichment on differentially abundant compounds
+  diff_enrich <- run_enrichment(diff_kegg_ids, label)
+  
+  diff_results[[label]] <- list(
+    comparison   = label,
+    diff_df      = diff_df,
+    enrichment   = diff_enrich
+  )
+}
+
+# ── 8. aPEAR visualization of differential enrichment ────────────────────────
+
+cat("\n── Step 8: aPEAR network plots for differential enrichment ──\n")
+
+for (label in names(diff_results)) {
+  res <- diff_results[[label]]$enrichment
+  if (is.null(res)) next
+  
+  res_df <- as.data.frame(res)
+  if (nrow(res_df) < apear_min_pathways) {
+    cat("  Skipping", label, "- fewer than", apear_min_pathways, "pathways\n")
+    next
+  }
+  
+  cat("  Plotting", label, "with", nrow(res_df), "pathways...\n")
+  
+  tryCatch({
+    p <- enrichmentNetwork(
+      res_df,
+      repelLabels      = TRUE,
+      drawEllipses     = TRUE,
+      colorBy          = "p.adjust",
+      nodeSize         = "Count",
+      similarityCutoff = apear_similarity_cutoff,
+      verbose          = FALSE
+    )
+    
+    p <- p + ggtitle(paste0("Differential Enrichment Network — ", label)) +
+      theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
+    
+    out_path <- file.path(output_dir, paste0("apear_diff_", label, ".png"))
+    ggsave(out_path, p, width = 12, height = 10, dpi = 300, bg = "white")
+    cat("  Saved:", out_path, "\n")
+  }, error = function(e) {
+    cat("  ERROR plotting", label, ":", e$message, "\n")
+  })
+}
+
+# ── 9. Export results to Excel ───────────────────────────────────────────────
+
+cat("\n── Step 9: Exporting results to Excel ──\n")
+
+sheets <- list()
+
+# Sheet 1: Average intensities
+sheets[["Average_Intensities"]] <- df_avg
+
+# Sheet 2: KEGG ID mapping
+sheets[["KEGG_Mapping"]] <- kegg_mapping
+
+# Sheets for per-condition enrichment
+for (cond in names(enrichment_results)) {
+  res <- enrichment_results[[cond]]
+  if (!is.null(res)) {
+    res_df <- as.data.frame(res) %>%
+      mutate(condition = cond) %>%
+      select(condition, everything())
+    sheets[[paste0("Enrich_", cond)]] <- res_df
+  }
+}
+
+# Combined condition enrichment
+all_cond_enrich <- bind_rows(lapply(names(enrichment_results), function(cond) {
+  res <- enrichment_results[[cond]]
+  if (!is.null(res)) {
+    as.data.frame(res) %>% mutate(condition = cond, .before = 1)
+  }
+}))
+if (nrow(all_cond_enrich) > 0) {
+  sheets[["All_Condition_Enrichment"]] <- all_cond_enrich
+}
+
+# Sheets for differential enrichment
+all_diff_enrich <- bind_rows(lapply(names(diff_results), function(label) {
+  res <- diff_results[[label]]$enrichment
+  if (!is.null(res)) {
+    as.data.frame(res) %>% mutate(comparison = label, .before = 1)
+  }
+}))
+if (nrow(all_diff_enrich) > 0) {
+  sheets[["Differential_Enrichment"]] <- all_diff_enrich
+}
+
+# Differential compound lists
+all_diff_compounds <- bind_rows(lapply(names(diff_results), function(label) {
+  diff_results[[label]]$diff_df %>%
+    filter(direction != "unchanged") %>%
+    mutate(comparison = label, .before = 1)
+}))
+if (nrow(all_diff_compounds) > 0) {
+  sheets[["Diff_Compounds"]] <- all_diff_compounds
+}
+
+# Write Excel file
+excel_path <- file.path(output_dir, "pathway_enrichment_results.xlsx")
+write_xlsx(sheets, excel_path)
+cat("  Saved:", excel_path, "\n")
+
+# ── 10. Summary barplot of enrichment counts ─────────────────────────────────
+
+cat("\n── Step 10: Summary visualizations ──\n")
+
+if (nrow(all_cond_enrich) > 0) {
+  p_bar <- ggplot(all_cond_enrich, aes(x = condition, fill = condition)) +
+    geom_bar() +
+    labs(
+      title = "Number of Enriched Pathways per Condition",
+      x = "Condition", y = "Number of Pathways"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "none",
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(file.path(output_dir, "enrichment_barplot_conditions.png"),
+         p_bar, width = 8, height = 6, dpi = 300, bg = "white")
+  cat("  Saved: enrichment_barplot_conditions.png\n")
+}
+
+if (nrow(all_diff_enrich) > 0) {
+  p_bar2 <- ggplot(all_diff_enrich, aes(x = comparison, fill = comparison)) +
+    geom_bar() +
+    labs(
+      title = "Number of Differentially Enriched Pathways per Comparison",
+      x = "Comparison", y = "Number of Pathways"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  ggsave(file.path(output_dir, "enrichment_barplot_differential.png"),
+         p_bar2, width = 10, height = 6, dpi = 300, bg = "white")
+  cat("  Saved: enrichment_barplot_differential.png\n")
+}
+
+# ── Done ─────────────────────────────────────────────────────────────────────
+
+cat("\n══════════════════════════════════════════════════════════════════\n")
+cat("  Analysis complete! Check the '", output_dir, "/' folder for:\n")
+cat("  • apear_network_<condition>.png   — per-condition aPEAR networks\n")
+cat("  • apear_diff_<comparison>.png     — differential aPEAR networks\n")
+cat("  • enrichment_barplot_*.png        — summary bar charts\n")
+cat("  • pathway_enrichment_results.xlsx — all enrichment tables\n")
+cat("══════════════════════════════════════════════════════════════════\n")
