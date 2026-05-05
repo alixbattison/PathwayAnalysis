@@ -352,13 +352,19 @@ for (cond in names(enrichment_results)) {
       res_df,
       repelLabels      = TRUE,
       drawEllipses     = TRUE,
-      colorBy          = "p.adjust",
+      colorBy          = "Count",
       nodeSize         = "Count",
       similarityCutoff = apear_similarity_cutoff,
       verbose          = FALSE
     )
     
     p <- p + ggtitle(paste0("Pathway Enrichment Network — ", cond)) +
+      scale_fill_viridis_c(option = "plasma", limits = c(0, max(res_df$Count)),
+                           name = "Compound\nHits") +
+      scale_colour_viridis_c(option = "plasma", limits = c(0, max(res_df$Count)),
+                             name = "Compound\nHits") +
+      scale_color_viridis_c(option = "plasma", limits = c(0, max(res_df$Count)),
+                            name = "Compound\nHits") +
       theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
     
     out_path <- file.path(output_dir, paste0("apear_network_", cond, ".png"))
@@ -454,13 +460,19 @@ for (label in names(diff_results)) {
       res_df,
       repelLabels      = TRUE,
       drawEllipses     = TRUE,
-      colorBy          = "p.adjust",
+      colorBy          = "Count",
       nodeSize         = "Count",
       similarityCutoff = apear_similarity_cutoff,
       verbose          = FALSE
     )
     
     p <- p + ggtitle(paste0("Differential Enrichment Network — ", label)) +
+      scale_fill_viridis_c(option = "plasma", limits = c(0, max(res_df$Count)),
+                           name = "Compound\nHits") +
+      scale_colour_viridis_c(option = "plasma", limits = c(0, max(res_df$Count)),
+                             name = "Compound\nHits") +
+      scale_color_viridis_c(option = "plasma", limits = c(0, max(res_df$Count)),
+                            name = "Compound\nHits") +
       theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold"))
     
     out_path <- file.path(output_dir, paste0("apear_diff_", label, ".png"))
