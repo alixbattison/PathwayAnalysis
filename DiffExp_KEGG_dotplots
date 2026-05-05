@@ -1,0 +1,1137 @@
+# =============================================================================
+# Metabolic Pathway Differential Enrichment — KEGG API & HMDB API
+# =============================================================================
+# Reads a metabolomics Excel file, identifies differentially expressed
+# metabolites (Mann-Whitney U, fold change, FDR correction), maps compound
+# names to KEGG and HMDB pathways via live API calls, computes pathway-level
+# enrichment using Fisher's exact test (ORA) and Mann-Whitney U, and produces:
+#   • A table of differentially expressed metabolites per comparison
+#   • Multi-panel dot plots of enriched KEGG/HMDB pathways (SVG + PNG)
+#   • A CSV file of pathway enrichment results with full pathway names,
+#     p-values, and enrichment scores
+#
+# IMPORTANT: All pathway identifiers (mmu, map, etc.) are converted to their
+#            full human-readable pathway names throughout all outputs.
+#
+# DATABASES (run independently):
+#   KEGG  — uses KEGGREST (Bioconductor): name → compound ID → pathway
+#   HMDB  — uses metaboliteIDmapping (Bioconductor) + HMDB REST API
+#
+# CONDITIONS (edit CONDITION_MAP to match your experiment):
+#   NC  = Cancer          (no torpor, cancer)
+#   NN, C = Control       (no torpor, no cancer)
+#   TC  = Torpor + Cancer
+#   TN  = Torpor
+#
+# REQUIRED PACKAGES:
+#   CRAN:         readxl, dplyr, tidyr, ggplot2, stringr, purrr,
+#                 scales, openxlsx, httr, jsonlite
+#   Bioconductor: KEGGREST, metaboliteIDmapping
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(purrr)
+  library(scales)
+  library(openxlsx)
+  library(httr)
+  library(jsonlite)
+})
+
+# =============================================================================
+# ── USER CONFIGURATION ────────────────────────────────────────────────────────
+# =============================================================================
+
+INPUT_FILE    <- "test_plasma_HILIC_rawintensities.xlsx"
+SHEET_NAME    <- "Sheet1"
+NAME_COL      <- "Name"
+SAMPLE_PREFIX <- "Plasma_"
+
+CONDITION_MAP <- list(
+  "^(NN|C)$" = "Control",
+  "^NC$"      = "Cancer",
+  "^TC$"      = "Torpor + Cancer",
+  "^TN$"      = "Torpor"
+)
+
+MIN_N         <- 3
+MIN_COMPOUNDS <- 2
+API_PAUSE_SEC <- 0.35
+
+# Differential expression thresholds
+# A metabolite is DE if: p_value < P_THRESHOLD AND abs(log2FC) >= LOG2FC_THRESHOLD
+# Using raw p-value as primary gate since FDR can be overly conservative with
+# small sample sizes typical in metabolomics.
+P_THRESHOLD      <- 0.05   # Raw p-value cutoff
+FDR_THRESHOLD    <- 0.25   # Relaxed FDR; used only as secondary info
+LOG2FC_THRESHOLD <- 0.585  # log2(1.5); set to 0 to use p-value only
+
+# Which database to run: "KEGG", "HMDB", or "BOTH"
+RUN_DATABASE  <- "BOTH"
+
+TOP_N_PLOT    <- 20
+
+# Output files
+# Dot plots: one file PER CONDITION (e.g., "KEGG_dotplot_Cancer.png")
+# Pattern: {db}_dotplot_{condition}.{ext}
+OUT_EXCEL     <- "differential_enrichment_API.xlsx"
+OUT_DE_CSV    <- "differentially_expressed_metabolites.csv"
+OUT_KEGG_ENRICH_CSV <- "KEGG_pathway_enrichment_results.csv"
+OUT_HMDB_ENRICH_CSV <- "HMDB_pathway_enrichment_results.csv"
+PLOT_WIDTH    <- 14   # single panel width (inches) — wide enough for full pathway names
+PLOT_HEIGHT   <- 10
+PLOT_DPI      <- 180
+
+# =============================================================================
+# ── HELPERS ───────────────────────────────────────────────────────────────────
+# =============================================================================
+
+safe_message <- function(...) message("[", format(Sys.time(), "%H:%M:%S"), "] ", ...)
+
+parse_condition <- function(col_name, prefix, cond_map) {
+  base <- sub(paste0("^", prefix), "", col_name)
+  code <- str_extract(base, "^[A-Za-z]+")
+  if (is.na(code)) return(NA_character_)
+  for (pat in names(cond_map)) {
+    if (grepl(pat, toupper(code), perl = TRUE)) return(cond_map[[pat]])
+  }
+  NA_character_
+}
+
+resolve_kegg_pathway_name <- function(pathway_id, cache_env) {
+  if (exists(pathway_id, envir = cache_env)) {
+    return(get(pathway_id, envir = cache_env))
+  }
+  resolved_name <- tryCatch({
+    Sys.sleep(API_PAUSE_SEC)
+    info <- KEGGREST::keggGet(pathway_id)[[1]]
+    nm <- info$NAME
+    if (is.null(nm) || length(nm) == 0) {
+      pathway_id
+    } else {
+      # KEGG pathway names end with " - Organism name (common name)"
+      # e.g. "D-Glutamine and D-glutamate metabolism - Homo sapiens (human)"
+      # We must strip ONLY the organism suffix, not dashes within the name.
+      #
+      # Strategy: match " - " followed by a known organism pattern at the end.
+      # The organism part is always "Genus species" optionally followed by
+      # "(common name)" at the very end of the string.
+      cleaned <- nm[1] %>%
+        # Remove " - Genus species (common name)" at end of string
+        # Genus = capital letter + lowercase; species = lowercase word
+        str_remove("\\s+-\\s+[A-Z][a-z]+\\s+[a-z]+.*$") %>%
+        trimws()
+      if (nchar(cleaned) == 0) pathway_id else cleaned
+    }
+  }, error = function(e) pathway_id)
+  assign(pathway_id, resolved_name, envir = cache_env)
+  resolved_name
+}
+
+# ── Plant / non-mammalian pathway blacklist ─────────────────────────────────
+# These are KEGG pathways specific to plants, fungi, or non-animal organisms.
+# They appear because KEGG compound→pathway links are organism-agnostic.
+PLANT_PATHWAY_PATTERNS <- c(
+  "photosynthesis",
+  "carbon fixation in photosynthetic",
+  "carotenoid biosynthesis",
+  "flavonoid biosynthesis",
+  "flavone and flavonol biosynthesis",
+  "isoflavonoid biosynthesis",
+  "anthocyanin biosynthesis",
+  "stilbenoid.*biosynthesis",
+  "diterpenoid biosynthesis",
+  "sesquiterpenoid and triterpenoid",
+  "monoterpenoid biosynthesis",
+  "indole alkaloid biosynthesis",
+  "isoquinoline alkaloid biosynthesis",
+  "tropane.*alkaloid",
+  "glucosinolate biosynthesis",
+  "benzoxazinoid biosynthesis",
+  "plant hormone signal transduction",
+  "plant.pathogen interaction",
+  "phenylpropanoid biosynthesis",
+  "phenylalanine.*tyrosine.*tryptophan biosynthesis",
+  "cutin.*suberine.*wax biosynthesis",
+  "circadian rhythm.*plant",
+  "betalain biosynthesis",
+  "zeatin biosynthesis",
+  "brassinosteroid biosynthesis",
+  "limonene.*pinene degradation",
+  "streptomycin biosynthesis",
+  "penicillin and cephalosporin biosynthesis",
+  "aflatoxin biosynthesis",
+  "tetracycline biosynthesis",
+  "novobiocin biosynthesis",
+  "staurosporine biosynthesis",
+  "biosynthesis of.*type II polyketide",
+  "biosynthesis of siderophore",
+  "C5-Branched dibasic acid",
+  "two.component system"
+)
+PLANT_REGEX <- paste0("(?i)(", paste(PLANT_PATHWAY_PATTERNS, collapse = "|"), ")")
+
+# ── Generic "Metabolic pathways" → more granular naming ─────────────────────
+# KEGG map01100 "Metabolic pathways" is an umbrella term covering everything.
+# map01110 "Biosynthesis of secondary metabolites" is similarly broad.
+# These are too generic to be informative. Remove them so the more specific
+# sub-pathway entries (which are always present alongside them) are shown.
+GENERIC_PATHWAY_PATTERNS <- c(
+  "^Metabolic pathways$",
+  "^Biosynthesis of secondary metabolites$",
+  "^Microbial metabolism in diverse environments$",
+  "^Carbon metabolism$",
+  "^2-Oxocarboxylic acid metabolism$",
+  "^Biosynthesis of amino acids$",
+  "^Biosynthesis of cofactors$",
+  "^Metabolic pathways - .*"
+)
+GENERIC_REGEX <- paste0("(", paste(GENERIC_PATHWAY_PATTERNS, collapse = "|"), ")")
+
+# Clean pathway results: remove plant pathways and overly generic terms
+filter_pathways <- function(df, pathway_col = "pathway_name") {
+  n_before <- nrow(df)
+  
+  df_clean <- df %>%
+    filter(!grepl(PLANT_REGEX, .data[[pathway_col]], perl = TRUE)) %>%
+    filter(!grepl(GENERIC_REGEX, .data[[pathway_col]], perl = TRUE))
+  
+  n_plant   <- n_before - nrow(df %>% filter(!grepl(PLANT_REGEX, .data[[pathway_col]], perl = TRUE)))
+  n_generic <- nrow(df %>% filter(!grepl(PLANT_REGEX, .data[[pathway_col]], perl = TRUE))) - nrow(df_clean)
+  
+  if (n_plant > 0)   safe_message("    Removed ", n_plant, " plant/non-mammalian pathway entries")
+  if (n_generic > 0) safe_message("    Removed ", n_generic, " overly generic pathway entries")
+  
+  df_clean
+}
+
+# =============================================================================
+# ── LOAD & PREPARE DATA ───────────────────────────────────────────────────────
+# =============================================================================
+
+safe_message("Reading: ", INPUT_FILE, " [", SHEET_NAME, "]")
+raw <- read_excel(INPUT_FILE, sheet = SHEET_NAME)
+
+sample_cols <- names(raw)[str_starts(names(raw), SAMPLE_PREFIX)]
+if (length(sample_cols) == 0)
+  stop("No sample columns found with prefix: ", SAMPLE_PREFIX)
+
+col_conds <- setNames(
+  sapply(sample_cols, parse_condition,
+         prefix = SAMPLE_PREFIX, cond_map = CONDITION_MAP),
+  sample_cols
+)
+
+safe_message("Sample → Condition mapping:")
+for (s in names(col_conds)) message("  ", s, " → ", col_conds[[s]])
+
+if (!"Control" %in% col_conds)
+  stop("No samples mapped to 'Control'. Check CONDITION_MAP.")
+
+df <- raw %>%
+  filter(sapply(.data[[NAME_COL]], is.character)) %>%
+  mutate(across(all_of(sample_cols),
+                ~ suppressWarnings(as.numeric(.)) %>% na_if(0)))
+
+safe_message("Named compounds: ", nrow(df))
+
+all_conditions  <- unique(na.omit(col_conds))
+non_control     <- setdiff(all_conditions, "Control")
+control_cols    <- names(col_conds[!is.na(col_conds) & col_conds == "Control"])
+
+safe_message("Non-control conditions: ", paste(non_control, collapse = ", "))
+
+# =============================================================================
+# ── DIFFERENTIAL EXPRESSION ANALYSIS (Metabolite Level) ──────────────────────
+# =============================================================================
+
+compute_differential_metabolites <- function(df, sample_cols, col_conds,
+                                             non_control, control_cols,
+                                             p_thresh = P_THRESHOLD,
+                                             log2fc_thresh = LOG2FC_THRESHOLD,
+                                             min_n = MIN_N) {
+  safe_message("Computing differentially expressed metabolites...")
+  safe_message("  Thresholds: p < ", p_thresh,
+               ", |log2FC| >= ", round(log2fc_thresh, 3))
+  
+  de_results <- list()
+  
+  for (cond in non_control) {
+    cond_cols <- names(col_conds[!is.na(col_conds) & col_conds == cond])
+    safe_message("  DE analysis: ", cond, " vs Control (",
+                 length(cond_cols), " vs ", length(control_cols), " samples)")
+    
+    res <- df %>%
+      rowwise() %>%
+      mutate(
+        ctrl_values = list(na.omit(c_across(all_of(control_cols)))),
+        cond_values = list(na.omit(c_across(all_of(cond_cols)))),
+        n_ctrl      = length(ctrl_values),
+        n_cond      = length(cond_values)
+      ) %>%
+      ungroup() %>%
+      filter(n_ctrl >= min_n, n_cond >= min_n) %>%
+      mutate(
+        median_ctrl = map_dbl(ctrl_values, ~ median(.x, na.rm = TRUE)),
+        median_cond = map_dbl(cond_values, ~ median(.x, na.rm = TRUE)),
+        fold_change = median_cond / pmax(median_ctrl, 1e-9),
+        log2_fc     = log2(pmax(fold_change, 1e-9)),
+        p_value     = map2_dbl(cond_values, ctrl_values, ~ {
+          tryCatch(
+            wilcox.test(.x, .y, exact = FALSE)$p.value,
+            error = function(e) 1
+          )
+        }),
+        fdr         = p.adjust(p_value, method = "BH"),
+        direction   = case_when(
+          log2_fc > 0 ~ "Up",
+          log2_fc < 0 ~ "Down",
+          TRUE        ~ "None"
+        ),
+        # Significant: raw p < threshold AND |log2FC| >= threshold
+        # abs(log2_fc) handles both up- and down-regulated correctly
+        significant = (p_value < p_thresh) & (abs(log2_fc) >= log2fc_thresh),
+        comparison  = paste0(cond, " vs Control")
+      ) %>%
+      select(all_of(NAME_COL), comparison, median_ctrl, median_cond,
+             fold_change, log2_fc, p_value, fdr, direction, significant) %>%
+      arrange(p_value)
+    
+    n_sig <- sum(res$significant, na.rm = TRUE)
+    n_up  <- sum(res$significant & res$direction == "Up", na.rm = TRUE)
+    n_dn  <- sum(res$significant & res$direction == "Down", na.rm = TRUE)
+    n_p   <- sum(res$p_value < p_thresh, na.rm = TRUE)
+    safe_message("    → ", n_p, " metabolites with p < ", p_thresh)
+    safe_message("    → ", n_sig, " DE metabolites (", n_up, " up, ", n_dn,
+                 " down) after |log2FC| >= ", round(log2fc_thresh, 3), " filter")
+    
+    # Fallback: if zero DE, relax to p-value only
+    if (n_sig == 0 && n_p > 0) {
+      safe_message("    ⚠ 0 DE metabolites with FC filter — falling back to p < ",
+                   p_thresh, " only")
+      res <- res %>% mutate(significant = p_value < p_thresh)
+      n_sig <- sum(res$significant, na.rm = TRUE)
+      safe_message("    → After fallback: ", n_sig, " DE metabolites")
+    }
+    
+    de_results[[cond]] <- res
+  }
+  
+  de_results
+}
+
+# =============================================================================
+# ── KEGG PATHWAY MAPPING ──────────────────────────────────────────────────────
+# =============================================================================
+
+map_kegg <- function(df, name_col, api_pause = API_PAUSE_SEC) {
+  
+  if (!requireNamespace("KEGGREST", quietly = TRUE))
+    stop("KEGGREST not installed. Run: BiocManager::install('KEGGREST')")
+  library(KEGGREST)
+  
+  compound_names <- df[[name_col]]
+  safe_message("KEGG: querying ", length(compound_names), " compound names...")
+  
+  cpd_cache <- list()
+  
+  query_kegg_cpd <- function(nm) {
+    if (!is.null(cpd_cache[[nm]])) return(cpd_cache[[nm]])
+    Sys.sleep(api_pause)
+    ids <- tryCatch({
+      hits <- keggFind("compound", nm)
+      if (length(hits) > 0) names(hits) else {
+        short <- word(nm, 1)
+        hits2 <- keggFind("compound", short)
+        if (length(hits2) > 0) names(hits2) else character(0)
+      }
+    }, error = function(e) character(0))
+    cpd_cache[[nm]] <<- ids
+    ids
+  }
+  
+  df_cpd <- df %>%
+    mutate(
+      kegg_cpd_ids = map(.data[[name_col]], query_kegg_cpd),
+      kegg_cpd     = map_chr(kegg_cpd_ids,
+                             ~ if (length(.x) > 0) .x[[1]] else NA_character_)
+    ) %>%
+    filter(!is.na(kegg_cpd))
+  
+  safe_message("KEGG: matched ", nrow(df_cpd), " / ", nrow(df), " compounds to KEGG IDs")
+  
+  safe_message("KEGG: fetching pathways for ", nrow(df_cpd), " matched compounds...")
+  
+  # --- Primary method: batch keggLink (much faster and more reliable) ---
+  # keggLink("pathway", "cpd") retrieves ALL compound→pathway links at once
+  safe_message("KEGG: attempting batch pathway lookup via keggLink...")
+  batch_links <- tryCatch({
+    all_links <- keggLink("pathway", "compound")
+    if (length(all_links) > 0) {
+      tibble(
+        kegg_cpd   = sub("^cpd:", "", names(all_links)),
+        pathway_id = sub("^path:", "", as.character(all_links))
+      )
+    } else {
+      NULL
+    }
+  }, error = function(e) {
+    safe_message("KEGG: batch keggLink failed: ", conditionMessage(e))
+    NULL
+  })
+  
+  if (!is.null(batch_links) && nrow(batch_links) > 0) {
+    safe_message("KEGG: batch lookup returned ", nrow(batch_links), " total links")
+    
+    # Strip "cpd:" prefix from our compound IDs to match
+    df_cpd_clean <- df_cpd %>%
+      mutate(kegg_cpd_clean = sub("^cpd:", "", kegg_cpd))
+    
+    df_pw <- df_cpd_clean %>%
+      inner_join(
+        batch_links %>% rename(kegg_cpd_clean = kegg_cpd),
+        by = "kegg_cpd_clean",
+        relationship = "many-to-many"
+      ) %>%
+      select(-kegg_cpd_clean)
+    
+    safe_message("KEGG: matched ", n_distinct(df_pw$pathway_id),
+                 " pathways for ", n_distinct(df_pw$kegg_cpd), " of our compounds")
+    
+  } else {
+    # --- Fallback: per-compound keggLink ---
+    safe_message("KEGG: falling back to per-compound keggLink...")
+    pw_id_cache <- list()
+    
+    get_cpd_pathways <- function(cpd_id) {
+      if (!is.null(pw_id_cache[[cpd_id]])) return(pw_id_cache[[cpd_id]])
+      Sys.sleep(api_pause)
+      pws <- tryCatch({
+        links <- keggLink("pathway", cpd_id)
+        if (length(links) > 0) {
+          unique(sub("^path:", "", as.character(links)))
+        } else {
+          character(0)
+        }
+      }, error = function(e) {
+        tryCatch({
+          info <- keggGet(cpd_id)[[1]]
+          if (!is.null(info$PATHWAY)) names(info$PATHWAY) else character(0)
+        }, error = function(e2) character(0))
+      })
+      pw_id_cache[[cpd_id]] <<- pws
+      pws
+    }
+    
+    df_pw <- df_cpd %>%
+      mutate(pathway_ids = map(kegg_cpd, get_cpd_pathways)) %>%
+      filter(lengths(pathway_ids) > 0) %>%
+      unnest(pathway_ids) %>%
+      rename(pathway_id = pathway_ids)
+  }
+  
+  safe_message("KEGG: found ", n_distinct(df_pw$pathway_id),
+               " unique pathways across ", n_distinct(df_pw$kegg_cpd), " compounds")
+  
+  # Diagnostic: show a few sample pathway IDs to verify format
+  if (nrow(df_pw) > 0) {
+    sample_ids <- head(unique(df_pw$pathway_id), 5)
+    safe_message("KEGG: sample pathway IDs: ", paste(sample_ids, collapse = ", "))
+  } else {
+    safe_message("KEGG: WARNING — 0 compound → pathway links found!")
+    safe_message("KEGG: This may indicate keggLink/keggGet API issues.")
+    # Return empty df with correct columns
+    return(df_cpd %>%
+             mutate(pathway_id = NA_character_, pathway_name = NA_character_) %>%
+             filter(FALSE))
+  }
+  
+  # ── Resolve ALL pathway IDs to full human-readable names ──────────────────
+  pw_ids_unique <- unique(df_pw$pathway_id)
+  safe_message("KEGG: resolving FULL pathway names for ", length(pw_ids_unique),
+               " unique pathway IDs...")
+  
+  pw_name_cache_env <- new.env(parent = emptyenv())
+  
+  pw_name_map <- setNames(
+    sapply(pw_ids_unique, function(pid) {
+      resolve_kegg_pathway_name(pid, pw_name_cache_env)
+    }),
+    pw_ids_unique
+  )
+  
+  still_coded <- pw_name_map[grepl("^(map|mmu|hsa|ko|ec|rn)\\d", pw_name_map)]
+  if (length(still_coded) > 0) {
+    safe_message("Retrying ", length(still_coded), " unresolved pathway IDs...")
+    for (pid in names(still_coded)) {
+      alt_id <- sub("^(mmu|hsa|ko|ec|rn)", "map", pid)
+      alt_name <- resolve_kegg_pathway_name(alt_id, pw_name_cache_env)
+      if (!grepl("^(map|mmu|hsa|ko|ec|rn)\\d", alt_name)) {
+        pw_name_map[[pid]] <- alt_name
+      }
+    }
+  }
+  
+  df_pw <- df_pw %>%
+    mutate(pathway_name = unname(pw_name_map[pathway_id]))
+  
+  n_before <- nrow(df_pw)
+  df_pw <- df_pw %>%
+    filter(!grepl("^(map|mmu|hsa|ko|ec|rn)\\d{4,}", pathway_name))
+  n_removed <- n_before - nrow(df_pw)
+  if (n_removed > 0) {
+    safe_message("Removed ", n_removed, " rows with unresolvable pathway IDs")
+  }
+  
+  safe_message("KEGG: final long table: ", nrow(df_pw), " compound × pathway rows")
+  
+  # Remove plant pathways and overly generic terms
+  safe_message("KEGG: filtering plant and generic pathways...")
+  df_pw <- filter_pathways(df_pw, "pathway_name")
+  safe_message("KEGG: after filtering: ", nrow(df_pw), " compound × pathway rows, ",
+               n_distinct(df_pw$pathway_name), " unique pathways")
+  
+  df_pw
+}
+
+# =============================================================================
+# ── HMDB PATHWAY MAPPING ──────────────────────────────────────────────────────
+# =============================================================================
+
+map_hmdb <- function(df, name_col, api_pause = API_PAUSE_SEC) {
+  
+  if (!requireNamespace("metaboliteIDmapping", quietly = TRUE))
+    stop("metaboliteIDmapping not installed. Run: BiocManager::install('metaboliteIDmapping')")
+  library(metaboliteIDmapping)
+  
+  safe_message("HMDB: loading metaboliteIDmapping table...")
+  id_tbl <- mappingTable()
+  
+  id_lower <- id_tbl %>%
+    mutate(.name_lower = tolower(Name)) %>%
+    select(.name_lower, HMDB) %>%
+    distinct() %>%
+    filter(!is.na(HMDB), HMDB != "")
+  
+  df_hmdb <- df %>%
+    mutate(.name_lower = tolower(.data[[name_col]])) %>%
+    left_join(id_lower, by = ".name_lower") %>%
+    select(-.name_lower) %>%
+    filter(!is.na(HMDB))
+  
+  safe_message("HMDB: matched ", nrow(df_hmdb), " / ", nrow(df), " compounds to HMDB IDs")
+  
+  hmdb_ids_unique <- unique(df_hmdb$HMDB)
+  safe_message("HMDB: querying REST API for ", length(hmdb_ids_unique), " unique HMDB IDs...")
+  
+  pw_cache <- list()
+  
+  query_hmdb_pws <- function(hmdb_id) {
+    if (!is.null(pw_cache[[hmdb_id]])) return(pw_cache[[hmdb_id]])
+    Sys.sleep(api_pause)
+    pws <- tryCatch({
+      url  <- paste0("https://hmdb.ca/metabolites/", hmdb_id, ".json")
+      resp <- GET(url, timeout(20))
+      if (status_code(resp) != 200) return(character(0))
+      data <- fromJSON(content(resp, "text", encoding = "UTF-8"), flatten = TRUE)
+      bio  <- data$biological_properties$pathways
+      if (is.null(bio) || nrow(bio) == 0) return(character(0))
+      unique(bio$name[!is.na(bio$name)])
+    }, error = function(e) character(0))
+    pw_cache[[hmdb_id]] <<- pws
+    pws
+  }
+  
+  df_pw <- df_hmdb %>%
+    mutate(pathway_names = map(HMDB, query_hmdb_pws)) %>%
+    filter(lengths(pathway_names) > 0) %>%
+    unnest(pathway_names) %>%
+    rename(pathway_name = pathway_names) %>%
+    filter(!is.na(pathway_name), nchar(pathway_name) > 0)
+  
+  safe_message("HMDB: final long table: ", nrow(df_pw), " compound × pathway rows")
+  
+  # Remove plant pathways and overly generic terms
+  safe_message("HMDB: filtering plant and generic pathways...")
+  df_pw <- filter_pathways(df_pw, "pathway_name")
+  safe_message("HMDB: after filtering: ", nrow(df_pw), " compound × pathway rows, ",
+               n_distinct(df_pw$pathway_name), " unique pathways")
+  
+  df_pw
+}
+
+# =============================================================================
+# ── PATHWAY ENRICHMENT ANALYSIS (ORA + Mann-Whitney) ─────────────────────────
+# =============================================================================
+
+compute_pathway_enrichment <- function(df_long, de_results, df_all,
+                                       sample_cols, col_conds,
+                                       non_control, control_cols,
+                                       min_n = MIN_N, min_cpds = MIN_COMPOUNDS) {
+  
+  all_metabolites  <- unique(df_all[[NAME_COL]])
+  n_background     <- length(all_metabolites)
+  mapped_metabolites <- unique(df_long[[NAME_COL]])
+  
+  safe_message("  Background: ", n_background, " total metabolites, ",
+               length(mapped_metabolites), " mapped to pathways")
+  
+  results <- list()
+  
+  for (cond in non_control) {
+    cond_cols <- names(col_conds[!is.na(col_conds) & col_conds == cond])
+    safe_message("  Enrichment: ", cond, " vs Control")
+    
+    # ── Get DE metabolite names (case-insensitive matching) ─────────────────
+    de_df <- de_results[[cond]]
+    de_names_raw <- de_df %>%
+      filter(significant == TRUE) %>%
+      pull(all_of(NAME_COL))
+    de_names_lower <- tolower(trimws(de_names_raw))
+    
+    n_de <- length(de_names_lower)
+    safe_message("    → ", n_de, " DE metabolites available for ORA")
+    
+    # ── Build pathway → metabolite list (with lowercased names for matching) ─
+    pathway_compounds <- df_long %>%
+      mutate(.name_lower = tolower(trimws(.data[[NAME_COL]]))) %>%
+      group_by(pathway_name) %>%
+      summarise(
+        pathway_metabolites = list(unique(.data[[NAME_COL]])),
+        pathway_metab_lower = list(unique(.name_lower)),
+        n_pathway           = n_distinct(.data[[NAME_COL]]),
+        .groups             = "drop"
+      ) %>%
+      filter(n_pathway >= min_cpds)
+    
+    safe_message("    → ", nrow(pathway_compounds), " pathways with >= ",
+                 min_cpds, " compounds")
+    
+    # ── Debug: check how many DE metabolites are in any pathway at all ──────
+    all_pw_metabs_lower <- unique(unlist(pathway_compounds$pathway_metab_lower))
+    n_de_in_any_pw <- sum(de_names_lower %in% all_pw_metabs_lower)
+    safe_message("    → ", n_de_in_any_pw, " / ", n_de,
+                 " DE metabolites found in at least one pathway")
+    
+    # ── ORA (Fisher's exact test) per pathway ───────────────────────────────
+    ora_results <- pathway_compounds %>%
+      mutate(
+        de_in_pathway = map_int(pathway_metab_lower,
+                                ~ sum(.x %in% de_names_lower)),
+        # 2x2 contingency table:
+        #                  In_Pathway   Not_In_Pathway
+        # DE               a            c
+        # Not_DE           b            d
+        ora_pvalue = map2_dbl(de_in_pathway, n_pathway, function(a, k) {
+          cc <- pmax(n_de - a, 0L)    # DE not in pathway
+          bb <- pmax(k - a, 0L)       # in pathway but not DE
+          dd <- pmax(n_background - a - bb - cc, 0L)
+          mat <- matrix(c(a, cc, bb, dd), nrow = 2, byrow = FALSE)
+          tryCatch(
+            fisher.test(mat, alternative = "greater")$p.value,
+            error = function(e) 1
+          )
+        }),
+        enrichment_score = ifelse(
+          n_de > 0 & n_pathway > 0,
+          (de_in_pathway / n_pathway) / (n_de / n_background),
+          0
+        ),
+        de_metabolites_in_pathway = map_chr(pathway_metabolites, ~ {
+          found <- .x[tolower(trimws(.x)) %in% de_names_lower]
+          if (length(found) == 0) "" else paste(found, collapse = "; ")
+        })
+      ) %>%
+      select(-pathway_metab_lower)
+    
+    n_ora_hit <- sum(ora_results$de_in_pathway > 0, na.rm = TRUE)
+    safe_message("    → ORA: ", n_ora_hit, " / ", nrow(ora_results),
+                 " pathways contain ≥1 DE metabolite")
+    
+    # ── Mann-Whitney U (intensity-based) per pathway ────────────────────────
+    mw_results <- df_long %>%
+      group_by(pathway_name) %>%
+      summarise(
+        n_compounds = n_distinct(.data[[NAME_COL]]),
+        ctrl_vals   = list(na.omit(unlist(across(all_of(control_cols))))),
+        cond_vals   = list(na.omit(unlist(across(all_of(cond_cols))))),
+        .groups     = "drop"
+      ) %>%
+      filter(
+        n_compounds >= min_cpds,
+        lengths(ctrl_vals) >= min_n,
+        lengths(cond_vals) >= min_n
+      ) %>%
+      mutate(
+        mw_pvalue = map2_dbl(cond_vals, ctrl_vals, ~ {
+          tryCatch(
+            wilcox.test(.x, .y, exact = FALSE)$p.value,
+            error = function(e) 1
+          )
+        }),
+        fold_enrichment = map2_dbl(cond_vals, ctrl_vals, ~ {
+          med_c <- median(.y, na.rm = TRUE)
+          median(.x, na.rm = TRUE) / max(med_c, 1e-9)
+        }),
+        log2_fold = log2(pmax(fold_enrichment, 1e-6)),
+        direction = ifelse(log2_fold > 0, "Enriched", "Depleted")
+      ) %>%
+      select(-ctrl_vals, -cond_vals)
+    
+    n_mw_sig <- sum(mw_results$mw_pvalue < 0.05, na.rm = TRUE)
+    safe_message("    → MW: ", n_mw_sig, " pathways with p < 0.05")
+    
+    # ── Merge ORA and MW ───────────────────────────────────────────────────
+    # Handle empty results: if either ORA or MW is empty, the full_join
+    # produces NA columns with wrong types. Force character for direction.
+    if (nrow(mw_results) > 0) {
+      mw_for_join <- mw_results %>%
+        mutate(direction = as.character(direction)) %>%
+        select(pathway_name, n_compounds, fold_enrichment, log2_fold,
+               mw_pvalue, direction)
+    } else {
+      # Create empty tibble with correct types
+      mw_for_join <- tibble(
+        pathway_name = character(), n_compounds = integer(),
+        fold_enrichment = double(), log2_fold = double(),
+        mw_pvalue = double(), direction = character()
+      )
+    }
+    
+    combined <- ora_results %>%
+      select(pathway_name, n_pathway, de_in_pathway, enrichment_score,
+             ora_pvalue, de_metabolites_in_pathway, pathway_metabolites) %>%
+      full_join(mw_for_join, by = "pathway_name") %>%
+      mutate(
+        n_compounds          = coalesce(n_pathway, n_compounds),
+        de_in_pathway        = coalesce(de_in_pathway, 0L),
+        enrichment_score     = coalesce(enrichment_score, 0),
+        ora_pvalue           = coalesce(ora_pvalue, 1),
+        mw_pvalue            = coalesce(mw_pvalue, 1),
+        fold_enrichment      = coalesce(fold_enrichment, 1),
+        log2_fold            = coalesce(log2_fold, 0),
+        direction            = ifelse(is.na(direction), "None", direction),
+        de_metabolites_in_pathway = ifelse(is.na(de_metabolites_in_pathway),
+                                           "", de_metabolites_in_pathway),
+        ora_fdr              = p.adjust(ora_pvalue, method = "BH"),
+        mw_fdr               = p.adjust(mw_pvalue, method = "BH"),
+        combined_pvalue      = pmin(ora_pvalue, mw_pvalue, na.rm = TRUE),
+        neg_log10_p          = -log10(combined_pvalue + 1e-300),
+        significant          = (ora_pvalue < 0.05) | (mw_pvalue < 0.05)
+      ) %>%
+      select(-pathway_metabolites, -n_pathway) %>%
+      arrange(combined_pvalue)
+    
+    n_sig <- sum(combined$significant, na.rm = TRUE)
+    n_p05 <- sum(combined$combined_pvalue < 0.05, na.rm = TRUE)
+    safe_message("    → Final: ", n_sig, " significant (raw p < 0.05 either test)")
+    safe_message("    → Final: ", n_p05, " pathways with combined p < 0.05")
+    
+    results[[cond]] <- combined
+  }
+  
+  results
+}
+
+# =============================================================================
+# ── ENRICHMENT DOT PLOT ──────────────────────────────────────────────────────
+# =============================================================================
+# Saves one figure per condition per database (e.g., KEGG_dotplot_Cancer.png)
+
+make_enrichment_dotplot <- function(results, db_label, top_n = TOP_N_PLOT,
+                                    width = PLOT_WIDTH, height = PLOT_HEIGHT,
+                                    dpi = PLOT_DPI) {
+  
+  saved_files <- character()
+  
+  for (i in seq_along(results)) {
+    cond      <- names(results)[i]
+    res       <- results[[cond]]
+    cond_safe <- gsub("[^A-Za-z0-9_]", "_", cond)  # filesystem-safe name
+    
+    # Filter and pick top pathways
+    plot_data <- res %>%
+      filter(n_compounds >= MIN_COMPOUNDS) %>%
+      filter(!grepl("^(map|mmu|hsa|ko|ec|rn)\\d{4,}", pathway_name)) %>%
+      filter(!grepl(PLANT_REGEX, pathway_name, perl = TRUE)) %>%
+      filter(!grepl(GENERIC_REGEX, pathway_name, perl = TRUE)) %>%
+      slice_min(combined_pvalue, n = top_n, with_ties = FALSE)
+    
+    if (nrow(plot_data) == 0) {
+      safe_message("  No pathways to plot for ", cond, " — skipping")
+      next
+    }
+    
+    # x-axis = enrichment ratio (-log10 p-value)
+    # color  = p-value (continuous gradient, low p = significant)
+    # size   = DE metabolite count in pathway
+    if (any(plot_data$de_in_pathway > 0, na.rm = TRUE)) {
+      plot_data <- plot_data %>%
+        mutate(size_val = pmax(de_in_pathway, 1))
+      size_lab <- "Count"
+    } else {
+      plot_data <- plot_data %>%
+        mutate(size_val = n_compounds)
+      size_lab <- "Count"
+    }
+    
+    # Use FULL pathway names — no truncation
+    plot_data <- plot_data %>%
+      mutate(
+        x_val      = neg_log10_p,
+        color_val  = combined_pvalue,
+        pw_display = pathway_name
+      ) %>%
+      arrange(x_val) %>%
+      mutate(pw_label = factor(pw_display, levels = pw_display))
+    
+    p <- ggplot(plot_data, aes(x = x_val, y = pw_label)) +
+      geom_point(aes(size = size_val, color = color_val), alpha = 0.85) +
+      scale_color_gradient(high = "#56B4E9", low = "#D55E00",
+                           name = "p-value",
+                           labels = scales::scientific) +
+      scale_size_continuous(range = c(5, 12), name = size_lab,
+                            breaks = function(x) unique(round(pretty(x, 4)))) +
+      labs(
+        title    = paste0(db_label, " — ", cond, "  vs  Control"),
+        subtitle = paste0("Dot size = DE metabolite count  ·  ",
+                          "Color = p-value  ·  ",
+                          "ORA + Mann-Whitney U  ·  Top ", top_n, " pathways"),
+        x        = expression(Enrichment~Ratio~~(-log[10](italic(p)))),
+        y        = NULL
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(
+        plot.title         = element_text(face = "bold", size = 13,
+                                          hjust = 0.5, margin = margin(b = 4)),
+        plot.subtitle      = element_text(size = 9, hjust = 0.5,
+                                          color = "#555555", margin = margin(b = 10)),
+        axis.text.y        = element_text(size = 9),
+        axis.text.x        = element_text(size = 9),
+        axis.title.x       = element_text(size = 10, margin = margin(t = 6)),
+        panel.grid.major.x = element_line(color = "#DDDDDD", linewidth = 0.4),
+        panel.grid.major.y = element_line(color = "#EEEEEE", linewidth = 0.3),
+        panel.grid.minor   = element_blank(),
+        legend.position    = "right",
+        legend.key.size    = unit(0.4, "cm"),
+        legend.text        = element_text(size = 8),
+        legend.title       = element_text(size = 9),
+        plot.margin        = margin(10, 16, 10, 10)
+      )
+    
+    # Save individual PNG and SVG
+    png_file <- paste0(db_label, "_dotplot_", cond_safe, ".png")
+    svg_file <- paste0(db_label, "_dotplot_", cond_safe, ".svg")
+    
+    ggsave(png_file, plot = p, width = width, height = height,
+           dpi = dpi, bg = "white")
+    safe_message("Saved: ", png_file)
+    
+    ggsave(svg_file, plot = p, width = width, height = height,
+           device = "svg", bg = "white")
+    safe_message("Saved: ", svg_file)
+    
+    saved_files <- c(saved_files, png_file, svg_file)
+    
+    print(p)
+  }
+  
+  invisible(saved_files)
+}
+
+# =============================================================================
+# ── EXPORT PATHWAY ENRICHMENT RESULTS (CSV) ──────────────────────────────────
+# =============================================================================
+
+export_enrichment_csv <- function(results, out_file, db_label) {
+  all_rows <- bind_rows(lapply(names(results), function(cond) {
+    results[[cond]] %>%
+      mutate(Comparison = paste0(cond, " vs Control")) %>%
+      transmute(
+        Comparison                = Comparison,
+        Pathway_Name              = pathway_name,
+        N_Metabolites_in_Pathway  = n_compounds,
+        DE_Metabolites_in_Pathway = de_in_pathway,
+        Enrichment_Score          = round(enrichment_score, 4),
+        Fold_Enrichment           = round(fold_enrichment, 4),
+        Log2_Fold_Change          = round(log2_fold, 4),
+        ORA_PValue                = signif(ora_pvalue, 6),
+        ORA_FDR                   = signif(ora_fdr, 6),
+        MannWhitney_PValue        = signif(mw_pvalue, 6),
+        MannWhitney_FDR           = signif(mw_fdr, 6),
+        Combined_PValue           = signif(combined_pvalue, 6),
+        Neg_Log10_PValue          = round(neg_log10_p, 4),
+        Direction                 = direction,
+        Significant               = significant,
+        DE_Metabolites_List       = de_metabolites_in_pathway,
+        Database                  = db_label
+      )
+  })) %>%
+    arrange(Comparison, Combined_PValue)
+  
+  # Safety: remove coded IDs, plant pathways, and generic terms
+  coded <- grepl("^(map|mmu|hsa|ko|ec|rn)\\d{4,}", all_rows$Pathway_Name)
+  plant <- grepl(PLANT_REGEX, all_rows$Pathway_Name, perl = TRUE)
+  generic <- grepl(GENERIC_REGEX, all_rows$Pathway_Name, perl = TRUE)
+  remove <- coded | plant | generic
+  if (any(remove)) {
+    safe_message("Removing ", sum(remove),
+                 " rows (coded IDs / plant / generic) from CSV output")
+    all_rows <- all_rows[!remove, ]
+  }
+  
+  write.csv(all_rows, out_file, row.names = FALSE)
+  safe_message("Saved enrichment CSV: ", out_file, " (", nrow(all_rows), " rows)")
+  invisible(all_rows)
+}
+
+# =============================================================================
+# ── EXCEL EXPORT ──────────────────────────────────────────────────────────────
+# =============================================================================
+
+export_excel <- function(results_list, de_results, out_file) {
+  
+  wb <- createWorkbook()
+  
+  .hdr <- function(bg, fc = "white")
+    createStyle(fontName = "Arial", fontSize = 10, fontColour = fc,
+                fgFill = bg, halign = "CENTER", valign = "CENTER",
+                textDecoration = "bold", wrapText = TRUE,
+                border = "Bottom", borderColour = "#CCCCCC")
+  
+  .write <- function(wb, sname, df, bg, note = NULL) {
+    sname <- substr(sname, 1, 31)
+    addWorksheet(wb, sname, gridLines = TRUE)
+    r0 <- 1L
+    if (!is.null(note)) {
+      writeData(wb, sname, note, startRow = 1, startCol = 1)
+      addStyle(wb, sname,
+               createStyle(fontColour = "#666666", fontSize = 9,
+                           fontName = "Arial", italic = TRUE),
+               rows = 1, cols = 1)
+      mergeCells(wb, sname, cols = 1:ncol(df), rows = 1)
+      r0 <- 2L
+    }
+    writeDataTable(wb, sname, df, startRow = r0, startCol = 1,
+                   tableStyle = "none", withFilter = TRUE,
+                   headerStyle = .hdr(bg))
+    n <- nrow(df)
+    if (n > 0) {
+      for (r in seq_len(n)) {
+        fg <- if (r %% 2 == 0) "#F5F5F5" else "#FFFFFF"
+        addStyle(wb, sname,
+                 createStyle(fgFill = fg, fontName = "Arial", fontSize = 9),
+                 rows = r0 + r, cols = 1:ncol(df),
+                 gridExpand = TRUE, stack = TRUE)
+      }
+    }
+    for (ci in which(sapply(df, is.numeric))) {
+      fmt <- if (grepl("pvalue|p_value|P_Value|fdr|FDR", names(df)[ci], ignore.case = TRUE))
+        "0.000000" else "0.0000"
+      addStyle(wb, sname,
+               createStyle(numFmt = fmt, fontName = "Arial", fontSize = 9),
+               rows = (r0 + 1):(r0 + n), cols = ci,
+               gridExpand = TRUE, stack = TRUE)
+    }
+    widths <- pmin(
+      sapply(seq_along(df), function(i)
+        max(nchar(as.character(c(names(df)[i], df[[i]]))), na.rm = TRUE) * 1.15),
+      52
+    )
+    setColWidths(wb, sname, cols = seq_along(df), widths = widths)
+    freezePane(wb, sname, firstActiveRow = r0 + 1)
+  }
+  
+  .comp_colors <- c(
+    "Cancer vs Control"          = "C0392B",
+    "Torpor vs Control"          = "117A65",
+    "Torpor + Cancer vs Control" = "8E44AD"
+  )
+  
+  # ── DE Metabolites ────────────────────────────────────────────────────────
+  de_combined <- bind_rows(de_results) %>%
+    select(all_of(NAME_COL), comparison, median_ctrl, median_cond,
+           fold_change, log2_fc, p_value, fdr, direction, significant) %>%
+    rename(Metabolite = all_of(NAME_COL), Comparison = comparison,
+           Median_Control = median_ctrl, Median_Condition = median_cond,
+           Fold_Change = fold_change, Log2_FC = log2_fc,
+           P_Value = p_value, FDR = fdr, Direction = direction,
+           Significant = significant)
+  
+  .write(wb, "DE Metabolites", de_combined, "2C3E50",
+         note = paste0("DE metabolites | Mann-Whitney U | p < ", P_THRESHOLD,
+                       " & |log2FC| >= ", round(LOG2FC_THRESHOLD, 3)))
+  
+  de_sig <- de_combined %>% filter(Significant == TRUE)
+  if (nrow(de_sig) > 0) {
+    .write(wb, "DE Significant Only", de_sig, "E74C3C",
+           note = "Significant DE metabolites only")
+  }
+  
+  # ── Pathway enrichment sheets ─────────────────────────────────────────────
+  for (db in names(results_list)) {
+    results <- results_list[[db]]
+    
+    all_combined <- bind_rows(lapply(names(results), function(cond) {
+      results[[cond]] %>%
+        mutate(Comparison = paste0(cond, " vs Control")) %>%
+        transmute(
+          Comparison, Pathway = pathway_name,
+          N_Compounds = n_compounds, DE_in_Pathway = de_in_pathway,
+          Enrichment_Score = enrichment_score,
+          Fold_Enrichment = fold_enrichment,
+          Log2_Fold_Change = log2_fold,
+          ORA_P_Value = ora_pvalue, ORA_FDR = ora_fdr,
+          MW_P_Value = mw_pvalue, MW_FDR = mw_fdr,
+          Combined_P_Value = combined_pvalue,
+          Neg_Log10_P = neg_log10_p,
+          Direction = direction, Significant = significant,
+          DE_Metabolites = de_metabolites_in_pathway
+        )
+    })) %>%
+      filter(!grepl("^(map|mmu|hsa|ko|ec|rn)\\d{4,}", Pathway)) %>%
+      filter(!grepl(PLANT_REGEX, Pathway, perl = TRUE)) %>%
+      filter(!grepl(GENERIC_REGEX, Pathway, perl = TRUE))
+    
+    for (cond in names(results)) {
+      comp  <- paste0(cond, " vs Control")
+      color <- .comp_colors[comp] %||% "34495E"
+      sub   <- filter(all_combined, Comparison == comp) %>% select(-Comparison)
+      .write(wb, paste0(db, " ", comp), sub, color,
+             note = paste0(db, " | ", comp, " | Full pathway names"))
+    }
+    
+    .write(wb, paste0(db, " All"), all_combined, "34495E",
+           note = paste0(db, " | All comparisons"))
+    
+    # Enrichment Score pivot
+    pivot_es <- all_combined %>%
+      select(Comparison, Pathway, Enrichment_Score) %>%
+      pivot_wider(names_from = Comparison, values_from = Enrichment_Score,
+                  values_fill = 0) %>%
+      mutate(.abs = apply(across(-Pathway), 1, function(x) max(abs(x), na.rm = TRUE))) %>%
+      arrange(desc(.abs)) %>% select(-.abs)
+    .write(wb, paste0(db, " EnrichScore Pvt"), pivot_es, "E67E22",
+           note = "Enrichment scores (full pathway names)")
+    
+    # -log10(p) pivot
+    pivot_p <- all_combined %>%
+      select(Comparison, Pathway, Neg_Log10_P) %>%
+      pivot_wider(names_from = Comparison, values_from = Neg_Log10_P,
+                  values_fill = 0) %>%
+      mutate(.mx = apply(across(-Pathway), 1, max, na.rm = TRUE)) %>%
+      arrange(desc(.mx)) %>% select(-.mx)
+    .write(wb, paste0(db, " NegLog10P Pvt"), pivot_p, "C0392B",
+           note = "-log10(p-value) (full pathway names)")
+  }
+  
+  saveWorkbook(wb, out_file, overwrite = TRUE)
+  safe_message("Saved Excel: ", out_file)
+}
+
+# =============================================================================
+# ── RUN PIPELINE ──────────────────────────────────────────────────────────────
+# =============================================================================
+
+all_results <- list()
+
+# ── Step 1: Differential Expression ──────────────────────────────────────────
+safe_message("\n===== DIFFERENTIAL EXPRESSION ANALYSIS =====")
+de_results <- compute_differential_metabolites(
+  df, sample_cols, col_conds, non_control, control_cols
+)
+
+de_all <- bind_rows(de_results)
+write.csv(de_all, OUT_DE_CSV, row.names = FALSE)
+safe_message("Saved DE metabolites: ", OUT_DE_CSV)
+
+for (cond in names(de_results)) {
+  cat("\n---", cond, "vs Control ---\n")
+  sig <- de_results[[cond]] %>% filter(significant)
+  cat("  Total tested:", nrow(de_results[[cond]]), "\n")
+  cat("  Significant:", nrow(sig), "\n")
+  if (nrow(sig) > 0) {
+    print(sig %>%
+            select(all_of(NAME_COL), fold_change, log2_fc, p_value, fdr, direction) %>%
+            mutate(across(c(fold_change, log2_fc), round, 3),
+                   p_value = signif(p_value, 3), fdr = signif(fdr, 3)) %>%
+            head(20))
+  }
+}
+
+# ── Step 2: KEGG ─────────────────────────────────────────────────────────────
+if (RUN_DATABASE %in% c("KEGG", "BOTH")) {
+  safe_message("\n===== KEGG PIPELINE =====")
+  kegg_long <- map_kegg(df, NAME_COL, API_PAUSE_SEC)
+  
+  safe_message("Running KEGG pathway enrichment...")
+  kegg_results <- compute_pathway_enrichment(
+    kegg_long, de_results, df,
+    sample_cols, col_conds, non_control, control_cols
+  )
+  all_results[["KEGG"]] <- kegg_results
+  
+  safe_message("Plotting KEGG enrichment dot plots (one per condition)...")
+  make_enrichment_dotplot(kegg_results, "KEGG", top_n = TOP_N_PLOT)
+  
+  export_enrichment_csv(kegg_results, OUT_KEGG_ENRICH_CSV, "KEGG")
+  
+  for (cond in names(kegg_results)) {
+    cat("\n--- KEGG:", cond, "vs Control ---\n")
+    print(kegg_results[[cond]] %>%
+            select(pathway_name, n_compounds, de_in_pathway,
+                   enrichment_score, ora_pvalue, mw_pvalue) %>%
+            head(15))
+  }
+}
+
+# ── Step 3: HMDB ─────────────────────────────────────────────────────────────
+if (RUN_DATABASE %in% c("HMDB", "BOTH")) {
+  safe_message("\n===== HMDB PIPELINE =====")
+  hmdb_long <- map_hmdb(df, NAME_COL, API_PAUSE_SEC)
+  
+  safe_message("Running HMDB pathway enrichment...")
+  hmdb_results <- compute_pathway_enrichment(
+    hmdb_long, de_results, df,
+    sample_cols, col_conds, non_control, control_cols
+  )
+  all_results[["HMDB"]] <- hmdb_results
+  
+  safe_message("Plotting HMDB enrichment dot plots (one per condition)...")
+  make_enrichment_dotplot(hmdb_results, "HMDB", top_n = TOP_N_PLOT)
+  
+  export_enrichment_csv(hmdb_results, OUT_HMDB_ENRICH_CSV, "HMDB")
+  
+  for (cond in names(hmdb_results)) {
+    cat("\n--- HMDB:", cond, "vs Control ---\n")
+    print(hmdb_results[[cond]] %>%
+            select(pathway_name, n_compounds, de_in_pathway,
+                   enrichment_score, ora_pvalue, mw_pvalue) %>%
+            head(15))
+  }
+}
+
+# ── Step 4: Excel ────────────────────────────────────────────────────────────
+if (!is.null(OUT_EXCEL) && length(all_results) > 0) {
+  safe_message("\n===== EXCEL EXPORT =====")
+  export_excel(all_results, de_results, OUT_EXCEL)
+}
+
+safe_message("\n===== ALL DONE =====")
+message("Output files:")
+message("  DE metabolites CSV  : ", OUT_DE_CSV)
+if (RUN_DATABASE %in% c("KEGG","BOTH")) {
+  message("  KEGG dot plots      : KEGG_dotplot_{condition}.png/svg (one per condition)")
+  message("  KEGG enrichment CSV : ", OUT_KEGG_ENRICH_CSV)
+}
+if (RUN_DATABASE %in% c("HMDB","BOTH")) {
+  message("  HMDB dot plots      : HMDB_dotplot_{condition}.png/svg (one per condition)")
+  message("  HMDB enrichment CSV : ", OUT_HMDB_ENRICH_CSV)
+}
+if (!is.null(OUT_EXCEL)) message("  Excel workbook      : ", OUT_EXCEL)
+safe_message("All pathway names are full human-readable names (no mmu/map codes).")
+safe_message("Plant/non-mammalian pathways and generic umbrella terms removed.")
